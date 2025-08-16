@@ -220,6 +220,52 @@ def get_user_requests(user_id: int, limit: int = 10) -> list:
     finally:
         conn.close()
 
+def check_package_installation_history(user_id: int, package_name: str) -> Optional[dict]:
+    """
+    Check if a package has been previously installed by the user.
+    Returns the most recent completed installation record if found, None otherwise.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Look for successfully completed installations of this package
+        cursor.execute("""
+            SELECT id, package_name, version, status, request_time, complete_time
+            FROM requests
+            WHERE user_id = ? AND package_name = ? AND status = 'completed'
+            ORDER BY complete_time DESC
+            LIMIT 1
+        """, (user_id, package_name))
+        
+        result = cursor.fetchone()
+        if result:
+            return {
+                'id': result[0],
+                'package_name': result[1],
+                'version': result[2],
+                'status': result[3],
+                'request_time': result[4],
+                'complete_time': result[5],
+                'was_installed': True
+            }
+        else:
+            return None
+            
+    except sqlite3.Error as e:
+        logger.error(f"Error checking package installation history: {e}")
+        return None
+    finally:
+        conn.close()
+
+def is_package_already_installed(user_id: int, package_name: str) -> bool:
+    """
+    Simple boolean check if a package has been previously installed by the user.
+    Returns True if the package was successfully installed before, False otherwise.
+    """
+    installation_record = check_package_installation_history(user_id, package_name)
+    return installation_record is not None
+
 def initialize_database() -> None:
     """Initialize the complete database setup."""
     logger.info("Initializing database...")

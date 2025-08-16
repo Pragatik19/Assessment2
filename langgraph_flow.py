@@ -15,7 +15,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from typing_extensions import Annotated, TypedDict
 
-from db_setup import log_request, update_request_status
+from db_setup import log_request, update_request_status, is_package_already_installed, check_package_installation_history
 from permissions_manager import PermissionManager
 
 # Configure logging
@@ -32,6 +32,8 @@ class InstallationState(TypedDict):
     version: str
     request_id: Optional[int]
     permission_granted: bool
+    already_installed: bool
+    installation_history: Optional[Dict[str, Any]]
     available_versions: List[str]
     installation_result: Dict[str, Any]
     error_message: Optional[str]
@@ -41,11 +43,11 @@ class InstallationWorkflow:
     
     def __init__(self, groq_api_key: str):
         # Use provided key or fall back to environment
-        self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
+        self.groq_api_key = os.getenv("GROQ_API_KEY")
         self.llm = ChatGroq(
             groq_api_key=self.groq_api_key,
-            model_name="gemma-2-9b-it",
-            temperature=0.1
+            model_name="gemma2-9b-it",
+            temperature=0.0  # Use 0 temperature for more consistent JSON output
         )
         self.permission_manager = PermissionManager()
         self.workflow = self._build_workflow()
@@ -58,10 +60,13 @@ class InstallationWorkflow:
         workflow.add_node("interpret_intent", self.interpret_intent)
         workflow.add_node("log_request", self.log_request_node)
         workflow.add_node("check_permissions", self.check_permissions)
+        workflow.add_node("check_installation_history", self.check_installation_history)
         workflow.add_node("check_versions", self.check_versions)
         workflow.add_node("execute_installation", self.execute_installation)
         workflow.add_node("update_completion", self.update_completion)
         workflow.add_node("handle_denial", self.handle_denial)
+        workflow.add_node("handle_already_installed", self.handle_already_installed)
+        workflow.add_node("handle_qa_response", self.handle_qa_response)
         workflow.add_node("handle_error", self.handle_error)
         
         # Set entry point
@@ -73,7 +78,7 @@ class InstallationWorkflow:
             self.route_after_intent,
             {
                 "install": "log_request",
-                "not_install": END,
+                "qa": "handle_qa_response",
                 "error": "handle_error"
             }
         )
@@ -84,8 +89,17 @@ class InstallationWorkflow:
             "check_permissions",
             self.route_after_permissions,
             {
-                "granted": "check_versions",
+                "granted": "check_installation_history",
                 "denied": "handle_denial"
+            }
+        )
+        
+        workflow.add_conditional_edges(
+            "check_installation_history",
+            self.route_after_installation_check,
+            {
+                "already_installed": "handle_already_installed",
+                "not_installed": "check_versions"
             }
         )
         
@@ -109,6 +123,8 @@ class InstallationWorkflow:
         
         workflow.add_edge("update_completion", END)
         workflow.add_edge("handle_denial", END)
+        workflow.add_edge("handle_already_installed", END)
+        workflow.add_edge("handle_qa_response", END)
         workflow.add_edge("handle_error", END)
         
         return workflow.compile()
@@ -167,46 +183,67 @@ class InstallationWorkflow:
             
             # If no pattern match, fall back to LLM
             prompt = f"""
-            Analyze the following user input to determine if it's an installation request:
+            You must analyze the user input and respond with ONLY a valid JSON object, no other text.
             
             User input: "{state['user_input']}"
             
-            Installation requests include any request to:
+            Determine if this is an installation request. Installation requests include:
             - Install, setup, add, or download a software package
             - Get or obtain a library or tool
             - Use pip, conda, or other package managers
             
-            Common phrases that indicate installation:
-            - "Install [package]"
-            - "Please install [package]"
-            - "Can you install [package]"
-            - "I need [package]"
-            - "Setup [package]"
-            - "Add [package]"
-            - "Get [package]"
-            - "Download [package]"
-            
-            Respond with JSON format:
+            Return ONLY this JSON format (no explanations):
             {{
                 "intent": "install" or "not_install",
-                "package_name": "extracted package name if install intent, else null",
-                "version": "specific version if mentioned, else null"
+                "package_name": "package_name_if_install_else_null",
+                "version": "version_if_specified_else_null"
             }}
             
             Examples:
-            - "Install numpy" -> {{"intent": "install", "package_name": "numpy", "version": null}}
-            - "Please install pandas" -> {{"intent": "install", "package_name": "pandas", "version": null}}
-            - "Install TensorFlow 2.13" -> {{"intent": "install", "package_name": "tensorflow", "version": "2.13"}}
-            - "What is PyTorch?" -> {{"intent": "not_install", "package_name": null, "version": null}}
-            - "How does numpy work?" -> {{"intent": "not_install", "package_name": null, "version": null}}
-            """
+            Input: "Install numpy" -> {{"intent": "install", "package_name": "numpy", "version": null}}
+            Input: "What is Python?" -> {{"intent": "not_install", "package_name": null, "version": null}}
+            Input: "Install pandas 1.5.0" -> {{"intent": "install", "package_name": "pandas", "version": "1.5.0"}}
+            
+            Respond with ONLY the JSON object:"""
             
             response = self.llm.invoke(prompt)
-            result = json.loads(response.content)
             
-            state["intent"] = result["intent"]
-            state["package_name"] = result["package_name"]
-            state["version"] = result["version"]
+            try:
+                # Try to parse as JSON
+                result = json.loads(response.content)
+                state["intent"] = result["intent"]
+                state["package_name"] = result["package_name"]
+                state["version"] = result["version"]
+            except json.JSONDecodeError:
+                # If JSON parsing fails, try to extract JSON from the response
+                response_text = response.content.strip()
+                logger.warning(f"Failed to parse JSON directly. Response: {response_text}")
+                
+                # Look for JSON block in the response using more comprehensive regex
+                import re
+                # Try to find JSON object with nested structure
+                json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text)
+                if not json_match:
+                    # Try simpler pattern
+                    json_match = re.search(r'\{.*?\}', response_text, re.DOTALL)
+                if json_match:
+                    try:
+                        result = json.loads(json_match.group())
+                        state["intent"] = result["intent"]
+                        state["package_name"] = result["package_name"]
+                        state["version"] = result["version"]
+                    except json.JSONDecodeError:
+                        # If still fails, assume it's not an install request
+                        logger.warning(f"Could not extract valid JSON from response: {response_text}")
+                        state["intent"] = "not_install"
+                        state["package_name"] = None
+                        state["version"] = None
+                else:
+                    # No JSON found, assume it's not an install request
+                    logger.warning(f"No JSON found in response: {response_text}")
+                    state["intent"] = "not_install" 
+                    state["package_name"] = None
+                    state["version"] = None
             
             logger.info(f"LLM interpreted intent: {state['intent']} for package {state['package_name']}")
             
@@ -224,7 +261,7 @@ class InstallationWorkflow:
         elif state["intent"] == "error":
             return "error"
         else:
-            return "not_install"
+            return "qa"
     
     def log_request_node(self, state: InstallationState) -> InstallationState:
         """Log the installation request to database."""
@@ -266,6 +303,87 @@ class InstallationWorkflow:
     def route_after_permissions(self, state: InstallationState) -> str:
         """Route based on permission check result."""
         return "granted" if state["permission_granted"] else "denied"
+    
+    def check_installation_history(self, state: InstallationState) -> InstallationState:
+        """Check if the package has been previously installed by the user."""
+        try:
+            is_installed = is_package_already_installed(state["user_id"], state["package_name"])
+            state["already_installed"] = is_installed
+            
+            if is_installed:
+                # Get the installation details
+                installation_history = check_package_installation_history(state["user_id"], state["package_name"])
+                state["installation_history"] = installation_history
+                logger.info(f"Package {state['package_name']} was previously installed by user {state['user_id']}")
+            else:
+                state["installation_history"] = None
+                logger.info(f"Package {state['package_name']} has not been installed before by user {state['user_id']}")
+                
+        except Exception as e:
+            logger.error(f"Error checking installation history: {e}")
+            state["already_installed"] = False
+            state["installation_history"] = None
+        
+        return state
+    
+    def route_after_installation_check(self, state: InstallationState) -> str:
+        """Route based on installation history check."""
+        return "already_installed" if state["already_installed"] else "not_installed"
+    
+    def handle_already_installed(self, state: InstallationState) -> InstallationState:
+        """Handle case where package is already installed."""
+        try:
+            # Update request status to indicate already installed
+            if state["request_id"]:
+                update_request_status(
+                    request_id=state["request_id"],
+                    status="completed",  # Mark as completed since it's already available
+                    error_message="Package already installed"
+                )
+            logger.info(f"Package {state['package_name']} already installed for user {state['user_id']}")
+        except Exception as e:
+            logger.error(f"Error updating already installed status: {e}")
+        
+        return state
+    
+    def handle_qa_response(self, state: InstallationState) -> InstallationState:
+        """Handle general Q&A responses using LLM."""
+        try:
+            prompt = f"""
+            You are a helpful AI assistant for a system setup tool. A user has asked a general question (not an installation request).
+            
+            User question: "{state['user_input']}"
+            
+            Please provide a helpful and informative response. If the question is about:
+            - Programming concepts: Explain clearly with examples
+            - Software tools: Provide usage information and best practices
+            - System setup: Give guidance on configuration and setup
+            - Package information: Explain what packages do and how they're used
+            
+            Keep your response concise but informative. If you're not sure about something, say so.
+            """
+            
+            response = self.llm.invoke(prompt)
+            
+            # Store the AI response in the state for formatting
+            state["installation_result"] = {
+                "success": True,
+                "ai_response": response.content,
+                "type": "qa_response"
+            }
+            
+            logger.info(f"Generated Q&A response for user {state['user_id']}")
+            
+        except Exception as e:
+            logger.error(f"Error generating Q&A response: {e}")
+            state["error_message"] = f"Failed to generate response: {str(e)}"
+            state["installation_result"] = {
+                "success": False,
+                "error": str(e),
+                "type": "qa_error"
+            }
+        
+        return state
     
     def check_versions(self, state: InstallationState) -> InstallationState:
         """Check available versions of the package."""
@@ -451,6 +569,10 @@ class InstallationWorkflow:
     
     def process_request(self, user_input: str, user_id: int, user_role: str) -> Dict[str, Any]:
         """Process an installation request through the complete workflow."""
+        return self.process_unified_request(user_input, user_id, user_role)
+    
+    def process_unified_request(self, user_input: str, user_id: int, user_role: str) -> Dict[str, Any]:
+        """Process a unified request (Q&A or installation) through the complete workflow."""
         initial_state = InstallationState(
             messages=[],
             user_id=user_id,
@@ -461,6 +583,8 @@ class InstallationWorkflow:
             version="",
             request_id=None,
             permission_granted=False,
+            already_installed=False,
+            installation_history=None,
             available_versions=[],
             installation_result={},
             error_message=None
@@ -468,7 +592,7 @@ class InstallationWorkflow:
         
         try:
             final_state = self.workflow.invoke(initial_state)
-            return self._format_response(final_state)
+            return self._format_unified_response(final_state)
         except Exception as e:
             logger.error(f"Workflow execution error: {e}")
             return {
@@ -517,6 +641,76 @@ class InstallationWorkflow:
         return {
             "success": False,
             "message": f"Installation failed: {state.get('error_message', 'Unknown error')}",
+            "type": "installation_error",
+            "error": state.get("error_message")
+        }
+    
+    def _format_unified_response(self, state: InstallationState) -> Dict[str, Any]:
+        """Format the final response for unified workflow (handles both Q&A and installation)."""
+        # Handle Q&A responses
+        if state["intent"] != "install":
+            if state.get("installation_result", {}).get("type") == "qa_response":
+                return {
+                    "success": True,
+                    "message": state["installation_result"]["ai_response"],
+                    "type": "qa_response"
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": state.get("error_message", "Failed to generate response"),
+                    "type": "qa_error"
+                }
+        
+        # Handle installation requests
+        if not state["permission_granted"]:
+            allowed_packages = self.permission_manager.get_allowed_packages(state["user_role"])
+            return {
+                "success": False,
+                "message": f"❌ You don't have permission to install {state['package_name']}. Please contact your administrator.",
+                "type": "permission_denied",
+                "allowed_packages": list(allowed_packages)[:10]  # Show first 10
+            }
+        
+        # Handle already installed packages
+        if state["already_installed"]:
+            installation_history = state.get("installation_history", {})
+            install_date = installation_history.get("complete_time", "unknown date") if installation_history else "unknown date"
+            installed_version = installation_history.get("version", "unknown version") if installation_history else "unknown version"
+            
+            return {
+                "success": True,
+                "message": f"📦 The package '{state['package_name']}' is already installed (version: {installed_version}, installed: {install_date})",
+                "type": "already_installed",
+                "package": state["package_name"],
+                "version": installed_version,
+                "install_date": install_date
+            }
+        
+        # Handle successful new installation
+        if state.get("installation_result", {}).get("success"):
+            installation_result = state["installation_result"]
+            message = f"✅ Successfully installed {state['package_name']}!"
+            
+            # Add verification status to message
+            if installation_result.get("verified"):
+                message += " Package verified and ready to use."
+            
+            return {
+                "success": True,
+                "message": message,
+                "type": "installation_success",
+                "package": state["package_name"],
+                "version": state.get("version", "latest"),
+                "request_id": state["request_id"],
+                "installation_output": installation_result.get("output", ""),
+                "verified": installation_result.get("verified", False)
+            }
+        
+        # Handle installation errors
+        return {
+            "success": False,
+            "message": f"❌ Installation failed: {state.get('error_message', 'Unknown error')}",
             "type": "installation_error",
             "error": state.get("error_message")
         }
